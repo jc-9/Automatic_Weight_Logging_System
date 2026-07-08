@@ -1,0 +1,14 @@
+# Core System Utilities
+setuptools<82.0.0
+docker
+influxdb-client
+
+# Data & Computer Vision
+numpy<2.0.0
+opencv-python
+pillow
+
+# Face Recognition Stack
+dlib
+face-recognition
+git+https://github.com/ageitgey/face_recognition_models
