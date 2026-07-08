@@ -6,7 +6,6 @@ import time
 from datetime import datetime
 import docker
 import re
-import socket
 import threading
 from influxdb_client import InfluxDBClient, Point, WriteOptions
 
@@ -63,44 +62,37 @@ class FaceEngine:
                 self.is_scanning = False
                 return
 
-            # Force explicit hardware resolution limits to prevent Pi stream scaling overhead
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-            # 🛠️ V4L2 BUFFER FLUSH: Let the sensor wake up, then dump the stale hardware buffer
+            # V4L2 BUFFER FLUSH
             time.sleep(0.4)
             for _ in range(6):
                 cap.read()
 
             start_time = time.time()
-            scan_duration = 10.0  # Open a continuous 10-second processing window
+            scan_duration = 10.0
             frames_processed = 0
 
             log("🧬 [VISION] Analyzing live video pipeline streams...")
             while time.time() - start_time < scan_duration:
                 ret, frame = cap.read()
-                
-                # If driver drops a frame, rest briefly and retry
                 if not ret or frame is None:
                     time.sleep(0.05)
                     continue
 
                 frames_processed += 1
-                
-                # Downsample frame to save Raspberry Pi CPU cycles
                 small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                # Find faces in the current frame
                 face_locations = face_recognition.face_locations(rgb_small_frame)
                 if not face_locations:
-                    continue  # No face? Jump straight to the next real-time frame
+                    continue
 
                 log(f"👤 [VISION] Face detected in frame {frames_processed}! Comparing features...")
                 face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
                 for face_encoding in face_encodings:
-                    # 0.58 tolerance improves performance under varied indoor lighting profiles
                     matches = face_recognition.compare_faces(self.known_encodings, face_encoding, tolerance=0.58)
                     face_distances = face_recognition.face_distance(self.known_encodings, face_encoding)
 
@@ -123,18 +115,16 @@ class FaceEngine:
             self.is_scanning = False
 
     def trigger_scan(self):
-        """Asynchronously dispatches face scan so log parsing never freezes."""
         if self.is_scanning:
             return
         self.is_scanning = True
-        self.active_user = "Unknown"  # Reset target baseline
+        self.active_user = "Unknown"
         threading.Thread(target=self._threaded_scan, daemon=True).start()
 
 # =====================================================================
-# SYSTEM STREAM PARSER (BACKGROUND THREAD WORKER)
+# SYSTEM STREAM PARSER (SINGLE BACKBONE THREAD WORKER)
 # =====================================================================
 def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
-    """Iterates cleanly over the Docker log generator stream to capture lines natively."""
     docker_client = docker.from_env()
     log_stream = None
 
@@ -169,123 +159,36 @@ def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
                         current_metrics["impedance"] = float(match.group(2))
                         log(f"⚖️ Intercepted Payload: {current_metrics['weight']} lbs.")
                         
-                        # ✨ IMMEDIATE COMMIT ACTION: Don't wait for trailer logs!
-                        final_user = engine.active_user
-                        if final_user != "Unknown":
-                            try:
-                                point = Point("weight_metrics") \
-                                    .tag("user", final_user) \
-                                    .field("weight", current_metrics["weight"]) \
-                                    .field("impedance", current_metrics["impedance"])
-
-                                write_api.write(bucket=BUCKET, org=ORG, record=point)
-                                log(f"🚀 Success: Instantly synced metrics for '{final_user}' to InfluxDB Dashboard.")
-                                
-                                # Reset identity memory state immediately after a successful upload
-                                current_metrics.clear()
-                                engine.active_user = "Unknown"
-                            except Exception as e:
-                                log(f"❌ InfluxDB Immediate Write Error: {e}")
-
-                # 🩸 PARSE BODY FAT (Optional supplementary update packet)
-                elif "bodyFatPercent:" in line:
-                    match = re.search(r"bodyFatPercent:\s+([0-9.]+)", line)
-                    if match:
-                        body_fat = float(match.group(1))
-                        final_user = engine.known_names[0] if engine.known_names else "justin" # Default or fallback lookup if already cleared
-                        
-                        # If we just cleared it above, we write a quick sub-update point for the fat tracking field
-                        try:
-                            point = Point("weight_metrics").tag("user", final_user).field("body_fat", body_fat)
-                            write_api.write(bucket=BUCKET, org=ORG, record=point)
-                            log(f"🩸 Success: Appended bodyFatPercent ({body_fat}%) to InfluxDB.")
-                        except Exception as db_err:
-                            pass
-
-                # Catch-all clearing mechanism if container prints its standard final teardown statements
-                elif "No exporters configured" in line or "measurement processed" in line:
-                    if current_metrics or engine.active_user != "Unknown":
-                        current_metrics.clear()
-                        engine.active_user = "Unknown"
-                        log("🟢 Session boundary log reached. Resetting states to default idle.")
-            
-            log("⚠️ [DOCKER ALERT] Log stream ended cleanly. Resetting handle...")
-            log_stream = None
-
-        except Exception as e:
-            log(f"⚠️ [STREAM WORKER ERROR] Connection issue: {e}")
-            log_stream = None
-            time.sleep(1.0)
-    
-    """Iterates cleanly over the Docker log generator stream to capture lines natively."""
-    docker_client = docker.from_env()
-    log_stream = None
-
-    while True:
-        if log_stream is None:
-            try:
-                container = docker_client.containers.get("bles")
-                current_epoch = int(time.time())
-                log_stream = container.logs(stream=True, follow=True, since=current_epoch)
-                log("🔄 [DOCKER LINK] Background thread successfully locked onto 'bles' stream.")
-            except Exception as e:
-                log(f"⏳ [DOCKER LINK] Worker waiting for container 'bles' to recover... ({e})")
-                time.sleep(2.0)
-                continue
-
-        try:
-            for chunk in log_stream:
-                line = chunk.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-
-                # ⚡ THE REACTION TRIGGER
-                if "Found device:" in line or "Renpho-Scale" in line:
-                    log(f"📶 [SCALE EVENT] Step-on detected! Captured line -> {line}")
-                    engine.trigger_scan()
-
-                # ⚖️ PARSE WEIGHTS & IMPEDANCE
-                elif "Measurement received:" in line:
-                    match = re.search(r"Measurement received:\s+([0-9.]+)\s+lbs\s+/\s+([0-9.]+)\s+Ohm", line)
-                    if match:
-                        current_metrics["weight"] = float(match.group(1))
-                        current_metrics["impedance"] = float(match.group(2))
-                        log(f"⚖️ Intercepted Payload: {current_metrics['weight']} lbs.")
+                        # Trigger an instant conditional write attempt if user identity is already resolved
+                        if engine.active_user != "Unknown":
+                            commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
 
                 # 🩸 PARSE BODY FAT
                 elif "bodyFatPercent:" in line:
                     match = re.search(r"bodyFatPercent:\s+([0-9.]+)", line)
-                    if match and "weight" in current_metrics:
+                    if match:
                         current_metrics["body_fat"] = float(match.group(1))
-
-                # 🚀 EXECUTE DATABASE UPLOAD
-                elif "No exporters configured" in line or "measurement processed" in line:
-                    if "weight" in current_metrics:
-                        final_user = engine.active_user
+                        log(f"🩸 Intercepted Body Fat: {current_metrics['body_fat']}%")
                         
-                        if final_user == "Unknown":
-                            log("🛑 [GUARD REJECTION] Weights compiled but face recognition failed. Skipping DB write.")
+                        # Trigger an instant conditional write attempt if user identity is already resolved
+                        if engine.active_user != "Unknown":
+                            commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
+
+                # 🟢 TRANSACTION END SIGNALS
+                elif "No exporters configured" in line or "measurement processed" in line or "Session boundary" in line:
+                    if "weight" in current_metrics and engine.active_user != "Unknown":
+                        # Catch out-of-order updates that missed immediate evaluation hooks
+                        commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
+                    else:
+                        # Safe fallback window: give parsing thread a minor delay block before dumping cache
+                        time.sleep(0.5)
+                        if "weight" in current_metrics and engine.active_user != "Unknown":
+                            commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
                         else:
-                            try:
-                                point = Point("weight_metrics") \
-                                    .tag("user", final_user) \
-                                    .field("weight", current_metrics["weight"]) \
-                                    .field("impedance", current_metrics["impedance"])
-                                
-                                if "body_fat" in current_metrics:
-                                    point.field("body_fat", current_metrics["body_fat"])
+                            current_metrics.clear()
+                            engine.active_user = "Unknown"
+                            log("🟢 Session boundary clean up. Returning worker to default idle state.")
 
-                                write_api.write(bucket=BUCKET, org=ORG, record=point)
-                                log(f"🚀 Success: Synced metrics for '{final_user}' to InfluxDB Dashboard.")
-                                
-                            except Exception as e:
-                                log(f"❌ InfluxDB Write Error: {e}")
-                        
-                        # Reset memory states back to default idle
-                        current_metrics.clear()
-                        engine.active_user = "Unknown"
-                        log("🟢 Transaction complete. Returning worker to low-power idle state.")
-            
             log("⚠️ [DOCKER ALERT] Log stream ended cleanly. Resetting handle...")
             log_stream = None
 
@@ -293,6 +196,32 @@ def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
             log(f"⚠️ [STREAM WORKER ERROR] Connection issue: {e}")
             log_stream = None
             time.sleep(1.0)
+
+# =====================================================================
+# MODULAR DATABASE COMMIT DRIVER
+# =====================================================================
+def commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET):
+    """Safely constructs data points and flushes metrics directly to InfluxDB."""
+    if "weight" not in current_metrics or engine.active_user == "Unknown":
+        return
+
+    try:
+        point = Point("weight_metrics") \
+            .tag("user", engine.active_user) \
+            .field("weight", current_metrics["weight"]) \
+            .field("impedance", current_metrics["impedance"])
+        
+        if "body_fat" in current_metrics:
+            point.field("body_fat", current_metrics["body_fat"])
+
+        write_api.write(bucket=BUCKET, org=ORG, record=point)
+        log(f"🚀 Success: Instantly synced metrics for '{engine.active_user}' to InfluxDB Dashboard.")
+        
+        # Clear specific variables following database flush
+        current_metrics.clear()
+        engine.active_user = "Unknown"
+    except Exception as e:
+        log(f"❌ InfluxDB Synchronous Write Error: {e}")
 
 # =====================================================================
 # SYSTEM MAIN ENGINE START
