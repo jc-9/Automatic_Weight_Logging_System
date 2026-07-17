@@ -9,6 +9,7 @@ import re
 import threading
 import socket
 from influxdb_client import InfluxDBClient, Point, WriteOptions
+import sdnotify
 
 # =====================================================================
 # OLED DISPLAY ENGINE INITIALIZATION
@@ -30,7 +31,12 @@ except Exception as e:
     font_large = None
     font_small = None
 
-# Global flag to track scale health for the screen
+
+# GLOBAL SYSTEMD WATCHDOG CONFIG
+notifier = sdnotify.SystemdNotifier()
+notifier.notify("READY=1")  # Let systemd know we booted successfully immediately
+HEARTBEAT_INTERVAL = 5.0  # Sends a watchdog ping every 5 seconds
+
 SCALE_READY = False
 
 def check_wifi():
@@ -238,6 +244,7 @@ def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
                 continue
 
         try:
+            # Note: This is a blocking loop. Watchdog pinging must live in a separate execution sequence.
             for chunk in log_stream:
                 line = chunk.decode("utf-8", errors="ignore").strip()
                 if not line:
@@ -256,7 +263,6 @@ def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
                         current_metrics["impedance"] = float(match.group(2))
                         log(f"⚖️ Intercepted Payload: {current_metrics['weight']} lbs.")
                         
-                        # Trigger an instant conditional write attempt if user identity is already resolved
                         if engine.active_user != "Unknown":
                             commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
 
@@ -267,17 +273,14 @@ def log_stream_worker(engine, current_metrics, write_api, ORG, BUCKET):
                         current_metrics["body_fat"] = float(match.group(1))
                         log(f"🩸 Intercepted Body Fat: {current_metrics['body_fat']}%")
                         
-                        # Trigger an instant conditional write attempt if user identity is already resolved
                         if engine.active_user != "Unknown":
                             commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
 
                 # 🟢 TRANSACTION END SIGNALS
                 elif "No exporters configured" in line or "measurement processed" in line or "Session boundary" in line:
                     if "weight" in current_metrics and engine.active_user != "Unknown":
-                        # Catch out-of-order updates that missed immediate evaluation hooks
                         commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
                     else:
-                        # Safe fallback window: give parsing thread a minor delay block before dumping cache
                         time.sleep(0.5)
                         if "weight" in current_metrics and engine.active_user != "Unknown":
                             commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET)
@@ -318,10 +321,8 @@ def commit_metrics_to_db(engine, current_metrics, write_api, ORG, BUCKET):
         write_api.write(bucket=BUCKET, org=ORG, record=point)
         log(f"🚀 Success: Instantly synced metrics for '{engine.active_user}' to InfluxDB Dashboard.")
         
-        # Flash the success screen in a background thread so we don't block
         threading.Thread(target=show_success_screen, args=(current_metrics["weight"],), daemon=True).start()
         
-        # Clear specific variables following database flush
         current_metrics.clear()
         engine.active_user = "Unknown"
     except Exception as e:
@@ -339,9 +340,7 @@ def start_reactive_system():
     
     log(f"🔍 Debug: Loaded NAS_IP={NAS_IP} from environment.")
     
-    # Init Display
     update_hmi('IDLE')
-    
     engine = FaceEngine()
     
     try:
@@ -362,23 +361,26 @@ def start_reactive_system():
     stream_thread.start()
     log("🟢 System armed. Dedicated background parser thread active.")
 
-    last_heartbeat_time = 0
-    HEARTBEAT_INTERVAL = 10.0
+    # Main thread owns the scheduling loop completely (Heartbeat & Cache timeouts)
+    last_heartbeat_time = time.time()
 
     while True:
         current_time = time.time()
         
+        # 💓 Handle Systemd Watchdog safely from here without thread blocking friction
         if current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL:
-            log("💓 [HEARTBEAT] Monitoring loop idling at minimal CPU utilization.")
+            log("💓 [WATCHDOG] Sending keep-alive ping to systemd service supervisor.")
+            notifier.notify("WATCHDOG=1")
             last_heartbeat_time = current_time
 
+        # ⏱️ Handle User Cache Timeout
         if engine.active_user != "Unknown" and (current_time - engine.user_lock_time > 60):
             log("⏱️ [TIMEOUT] Identity cache expired without weights. Resetting.")
             engine.active_user = "Unknown"
             current_metrics.clear()
             update_hmi('IDLE')
 
-        time.sleep(1.0)
+        time.sleep(0.5)
 
 if __name__ == '__main__':
     start_reactive_system()

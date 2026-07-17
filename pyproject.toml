@@ -12,6 +12,7 @@ dependencies = [
     "numpy<2",
     "opencv-python>=4.11.0.86",
     "pillow>=12.2.0",
+    "sdnotify>=0.3.2",
     "setuptools<82",
 ]
 
